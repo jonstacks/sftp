@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/spf13/afero"
 )
 
 const (
@@ -30,13 +31,15 @@ type Server struct {
 	debugStream   io.Writer
 	readOnly      bool
 	pktMgr        *packetManager
-	openFiles     map[string]*os.File
+	openFiles     map[string]afero.File
 	openFilesLock sync.RWMutex
 	handleCount   int
 	maxTxPacket   uint32
+	// What underlying filesystm to use for the SFTP Server.
+	fileSystem afero.Fs
 }
 
-func (svr *Server) nextHandle(f *os.File) string {
+func (svr *Server) nextHandle(f afero.File) string {
 	svr.openFilesLock.Lock()
 	defer svr.openFilesLock.Unlock()
 	svr.handleCount++
@@ -56,7 +59,7 @@ func (svr *Server) closeHandle(handle string) error {
 	return syscall.EBADF
 }
 
-func (svr *Server) getHandle(handle string) (*os.File, bool) {
+func (svr *Server) getHandle(handle string) (afero.File, bool) {
 	svr.openFilesLock.RLock()
 	defer svr.openFilesLock.RUnlock()
 	f, ok := svr.openFiles[handle]
@@ -85,8 +88,9 @@ func NewServer(rwc io.ReadWriteCloser, options ...ServerOption) (*Server, error)
 		serverConn:  svrConn,
 		debugStream: ioutil.Discard,
 		pktMgr:      newPktMgr(svrConn),
-		openFiles:   make(map[string]*os.File),
+		openFiles:   make(map[string]afero.File),
 		maxTxPacket: 1 << 15,
+		fileSystem:  afero.NewMemMapFs(),
 	}
 
 	for _, o := range options {
@@ -113,6 +117,14 @@ func WithDebug(w io.Writer) ServerOption {
 func ReadOnly() ServerOption {
 	return func(s *Server) error {
 		s.readOnly = true
+		return nil
+	}
+}
+
+// Filesystem configures the filesystem as seen by the SFTP Server.
+func Filesystem(fs afero.Fs) ServerOption {
+	return func(s *Server) error {
+		s.fileSystem = fs
 		return nil
 	}
 }
@@ -159,7 +171,7 @@ func handlePacket(s *Server, p interface{}) error {
 		return s.sendPacket(sshFxVersionPacket{sftpProtocolVersion, nil})
 	case *sshFxpStatPacket:
 		// stat the requested file
-		info, err := os.Stat(p.Path)
+		info, err := s.fileSystem.Stat(p.Path)
 		if err != nil {
 			return s.sendError(p, err)
 		}
@@ -168,8 +180,9 @@ func handlePacket(s *Server, p interface{}) error {
 			info: info,
 		})
 	case *sshFxpLstatPacket:
-		// stat the requested file
-		info, err := os.Lstat(p.Path)
+		// stat the requested file. TODO: Figure out if the filesystem needs an
+		// Lstat package.
+		info, err := s.fileSystem.Stat(p.Path)
 		if err != nil {
 			return s.sendError(p, err)
 		}
@@ -194,18 +207,19 @@ func handlePacket(s *Server, p interface{}) error {
 		})
 	case *sshFxpMkdirPacket:
 		// TODO FIXME: ignore flags field
-		err := os.Mkdir(p.Path, 0755)
+		err := s.fileSystem.Mkdir(p.Path, 0755)
 		return s.sendError(p, err)
 	case *sshFxpRmdirPacket:
-		err := os.Remove(p.Path)
+		err := s.fileSystem.Remove(p.Path)
 		return s.sendError(p, err)
 	case *sshFxpRemovePacket:
-		err := os.Remove(p.Filename)
+		err := s.fileSystem.Remove(p.Filename)
 		return s.sendError(p, err)
 	case *sshFxpRenamePacket:
-		err := os.Rename(p.Oldpath, p.Newpath)
+		err := s.fileSystem.Rename(p.Oldpath, p.Newpath)
 		return s.sendError(p, err)
 	case *sshFxpSymlinkPacket:
+		// TODO: filesystem doesn't implement Symlink
 		err := os.Symlink(p.Targetpath, p.Linkpath)
 		return s.sendError(p, err)
 	case *sshFxpClosePacket:
@@ -397,7 +411,7 @@ func (p sshFxpOpenPacket) respond(svr *Server) error {
 		osFlags |= os.O_EXCL
 	}
 
-	f, err := os.OpenFile(p.Path, osFlags, 0644)
+	f, err := svr.fileSystem.OpenFile(p.Path, osFlags, 0644)
 	if err != nil {
 		return svr.sendError(p, err)
 	}
@@ -491,7 +505,7 @@ func (p sshFxpFsetstatPacket) respond(svr *Server) error {
 	if (p.Flags & ssh_FILEXFER_ATTR_PERMISSIONS) != 0 {
 		var mode uint32
 		if mode, b, err = unmarshalUint32Safe(b); err == nil {
-			err = f.Chmod(os.FileMode(mode))
+			err = svr.fileSystem.Chmod(f.Name(), os.FileMode(mode))
 		}
 	}
 	if (p.Flags & ssh_FILEXFER_ATTR_ACMODTIME) != 0 {
@@ -506,13 +520,15 @@ func (p sshFxpFsetstatPacket) respond(svr *Server) error {
 		}
 	}
 	if (p.Flags & ssh_FILEXFER_ATTR_UIDGID) != 0 {
-		var uid uint32
-		var gid uint32
-		if uid, b, err = unmarshalUint32Safe(b); err != nil {
-		} else if gid, _, err = unmarshalUint32Safe(b); err != nil {
-		} else {
-			err = f.Chown(int(uid), int(gid))
-		}
+		// TODO: Afero doesn't support chown from what I can tell. Determine if we
+		// need this later on.
+		// var uid uint32
+		// var gid uint32
+		// if uid, b, err = unmarshalUint32Safe(b); err != nil {
+		// } else if gid, _, err = unmarshalUint32Safe(b); err != nil {
+		// } else {
+		// 	err = f.Chown(int(uid), int(gid))
+		// }
 	}
 
 	return svr.sendError(p, err)
