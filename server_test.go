@@ -228,6 +228,17 @@ func TestConcurrentRequests(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(concurrency)
 
+	// Create the file since we are using a memory mapped file system and
+	// /etc/passwd probably won't exist yet at this point.
+	f, err := client.Create("/etc/passwd")
+	if err != nil {
+		t.Errorf("Error opening file to write to for testing: %s", err)
+	}
+	err = f.Close()
+	if err != nil {
+		t.Errorf("Error closing file: %s", err)
+	}
+
 	for i := 0; i < concurrency; i++ {
 		go func() {
 			defer wg.Done()

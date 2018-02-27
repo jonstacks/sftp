@@ -9,7 +9,6 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -28,42 +27,13 @@ const (
 // as specified at http://tools.ietf.org/html/draft-ietf-secsh-filexfer-02
 type Server struct {
 	*serverConn
-	debugStream   io.Writer
-	readOnly      bool
-	pktMgr        *packetManager
-	openFiles     map[string]afero.File
-	openFilesLock sync.RWMutex
-	handleCount   int
-	maxTxPacket   uint32
+	debugStream io.Writer
+	readOnly    bool
+	pktMgr      *packetManager
+	handleMgr   *handleManager
+	maxTxPacket uint32
 	// What underlying filesystm to use for the SFTP Server.
 	fileSystem afero.Fs
-}
-
-func (svr *Server) nextHandle(f afero.File) string {
-	svr.openFilesLock.Lock()
-	defer svr.openFilesLock.Unlock()
-	svr.handleCount++
-	handle := strconv.Itoa(svr.handleCount)
-	svr.openFiles[handle] = f
-	return handle
-}
-
-func (svr *Server) closeHandle(handle string) error {
-	svr.openFilesLock.Lock()
-	defer svr.openFilesLock.Unlock()
-	if f, ok := svr.openFiles[handle]; ok {
-		delete(svr.openFiles, handle)
-		return f.Close()
-	}
-
-	return syscall.EBADF
-}
-
-func (svr *Server) getHandle(handle string) (afero.File, bool) {
-	svr.openFilesLock.RLock()
-	defer svr.openFilesLock.RUnlock()
-	f, ok := svr.openFiles[handle]
-	return f, ok
 }
 
 type serverRespondablePacket interface {
@@ -88,7 +58,7 @@ func NewServer(rwc io.ReadWriteCloser, options ...ServerOption) (*Server, error)
 		serverConn:  svrConn,
 		debugStream: ioutil.Discard,
 		pktMgr:      newPktMgr(svrConn),
-		openFiles:   make(map[string]afero.File),
+		handleMgr:   newHandleManager(),
 		maxTxPacket: 1 << 15,
 		fileSystem:  afero.NewMemMapFs(),
 	}
@@ -191,7 +161,7 @@ func handlePacket(s *Server, p interface{}) error {
 			info: info,
 		})
 	case *sshFxpFstatPacket:
-		f, ok := s.getHandle(p.Handle)
+		f, ok := s.handleMgr.GetHandle(p.Handle)
 		if !ok {
 			return s.sendError(p, syscall.EBADF)
 		}
@@ -223,7 +193,7 @@ func handlePacket(s *Server, p interface{}) error {
 		err := os.Symlink(p.Targetpath, p.Linkpath)
 		return s.sendError(p, err)
 	case *sshFxpClosePacket:
-		return s.sendError(p, s.closeHandle(p.Handle))
+		return s.sendError(p, s.handleMgr.CloseHandle(p.Handle))
 	case *sshFxpReadlinkPacket:
 		f, err := os.Readlink(p.Path)
 		if err != nil {
@@ -260,7 +230,7 @@ func handlePacket(s *Server, p interface{}) error {
 			Pflags: ssh_FXF_READ,
 		}.respond(s)
 	case *sshFxpReadPacket:
-		f, ok := s.getHandle(p.Handle)
+		f, ok := s.handleMgr.GetHandle(p.Handle)
 		if !ok {
 			return s.sendError(p, syscall.EBADF)
 		}
@@ -276,7 +246,7 @@ func handlePacket(s *Server, p interface{}) error {
 			Data:   data[:n],
 		})
 	case *sshFxpWritePacket:
-		f, ok := s.getHandle(p.Handle)
+		f, ok := s.handleMgr.GetHandle(p.Handle)
 		if !ok {
 			return s.sendError(p, syscall.EBADF)
 		}
@@ -330,9 +300,9 @@ func (svr *Server) Serve() error {
 	wg.Wait()      // wait for all workers to exit
 
 	// close any still-open files
-	for handle, file := range svr.openFiles {
+	for handle, file := range svr.handleMgr.OpenHandles() {
 		fmt.Fprintf(svr.debugStream, "sftp server file with handle %q left open: %v\n", handle, file.Name())
-		file.Close()
+		svr.handleMgr.CloseHandle(handle)
 	}
 	return err // error from recvPacket
 }
@@ -416,12 +386,12 @@ func (p sshFxpOpenPacket) respond(svr *Server) error {
 		return svr.sendError(p, err)
 	}
 
-	handle := svr.nextHandle(f)
+	handle := svr.handleMgr.NextHandle(f)
 	return svr.sendPacket(sshFxpHandlePacket{p.ID, handle})
 }
 
 func (p sshFxpReaddirPacket) respond(svr *Server) error {
-	f, ok := svr.getHandle(p.Handle)
+	f, ok := svr.handleMgr.GetHandle(p.Handle)
 	if !ok {
 		return svr.sendError(p, syscall.EBADF)
 	}
@@ -486,7 +456,7 @@ func (p sshFxpSetstatPacket) respond(svr *Server) error {
 }
 
 func (p sshFxpFsetstatPacket) respond(svr *Server) error {
-	f, ok := svr.getHandle(p.Handle)
+	f, ok := svr.handleMgr.GetHandle(p.Handle)
 	if !ok {
 		return svr.sendError(p, syscall.EBADF)
 	}
