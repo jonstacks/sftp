@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -357,12 +359,16 @@ func (p sshFxpOpenPacket) hasPflags(flags ...uint32) bool {
 
 func (p sshFxpOpenPacket) respond(svr *Server) error {
 	var osFlags int
+	modes := []string{}
 	if p.hasPflags(ssh_FXF_READ, ssh_FXF_WRITE) {
 		osFlags |= os.O_RDWR
+		modes = append(modes, "O_RDWR")
 	} else if p.hasPflags(ssh_FXF_WRITE) {
 		osFlags |= os.O_WRONLY
+		modes = append(modes, "O_WRONGLY")
 	} else if p.hasPflags(ssh_FXF_READ) {
 		osFlags |= os.O_RDONLY
+		modes = append(modes, "O_RDONLY")
 	} else {
 		// how are they opening?
 		return svr.sendError(p, syscall.EINVAL)
@@ -370,19 +376,27 @@ func (p sshFxpOpenPacket) respond(svr *Server) error {
 
 	if p.hasPflags(ssh_FXF_APPEND) {
 		osFlags |= os.O_APPEND
+		modes = append(modes, "O_APPEND")
 	}
 	if p.hasPflags(ssh_FXF_CREAT) {
 		osFlags |= os.O_CREATE
+		modes = append(modes, "O_CREATE")
 	}
 	if p.hasPflags(ssh_FXF_TRUNC) {
 		osFlags |= os.O_TRUNC
+		modes = append(modes, "O_TRUNC")
 	}
 	if p.hasPflags(ssh_FXF_EXCL) {
 		osFlags |= os.O_EXCL
+		modes = append(modes, "O_EXCL")
 	}
+
+	modeStr := strings.Join(modes, "|")
+	log.Printf("Opening %s with flags: %s\n", p.Path, modeStr)
 
 	f, err := svr.fileSystem.OpenFile(p.Path, osFlags, 0644)
 	if err != nil {
+		log.Println(err.Error())
 		return svr.sendError(p, err)
 	}
 
