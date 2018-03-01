@@ -36,6 +36,9 @@ type Server struct {
 	maxTxPacket uint32
 	// What underlying filesystm to use for the SFTP Server.
 	fileSystem afero.Fs
+	// A log.Logger that we can write to. Useful to allow others to inject their
+	// own logger if so desired
+	logger *log.Logger
 }
 
 type serverRespondablePacket interface {
@@ -63,6 +66,7 @@ func NewServer(rwc io.ReadWriteCloser, options ...ServerOption) (*Server, error)
 		handleMgr:   newHandleManager(),
 		maxTxPacket: 1 << 15,
 		fileSystem:  afero.NewMemMapFs(),
+		logger:      nil,
 	}
 
 	for _, o := range options {
@@ -97,6 +101,14 @@ func ReadOnly() ServerOption {
 func Filesystem(fs afero.Fs) ServerOption {
 	return func(s *Server) error {
 		s.fileSystem = fs
+		return nil
+	}
+}
+
+// Logger sets the logger for the SFTP Server
+func Logger(logger *log.Logger) ServerOption {
+	return func(s *Server) error {
+		s.logger = logger
 		return nil
 	}
 }
@@ -392,11 +404,15 @@ func (p sshFxpOpenPacket) respond(svr *Server) error {
 	}
 
 	modeStr := strings.Join(modes, "|")
-	log.Printf("Opening %s with flags: %s\n", p.Path, modeStr)
+	if svr.logger != nil {
+		svr.logger.Printf("Opening %s with flags: %s\n", p.Path, modeStr)
+	}
 
 	f, err := svr.fileSystem.OpenFile(p.Path, osFlags, 0644)
 	if err != nil {
-		log.Println(err.Error())
+		if svr.logger != nil {
+			svr.logger.Printf("Error opening '%s': %s\n", p.Path, err.Error())
+		}
 		return svr.sendError(p, err)
 	}
 
